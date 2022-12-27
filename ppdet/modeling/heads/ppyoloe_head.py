@@ -25,6 +25,9 @@ from ppdet.modeling.backbones.cspresnet import ConvBNLayer
 from ppdet.modeling.ops import get_static_shape, get_act_fn
 from ppdet.modeling.layers import MultiClassNMS
 
+from ppdet.slim.distill import KnowledgeDistillationKLDivLoss
+
+
 __all__ = ['PPYOLOEHead']
 
 
@@ -128,6 +131,8 @@ class PPYOLOEHead(nn.Layer):
         self.proj_conv = nn.Conv2D(self.reg_channels, 1, 1, bias_attr=False)
         self.proj_conv.skip_quant = True
         self._init_weights()
+
+        self.loss_kd = KnowledgeDistillationKLDivLoss(loss_weight=1000000000, T=1)
 
     @classmethod
     def from_config(cls, cfg, input_shape):
@@ -288,6 +293,7 @@ class PPYOLOEHead(nn.Layer):
         # select positive samples mask
         mask_positive = (assigned_labels != self.num_classes)
         num_pos = mask_positive.sum()
+
         # pos/neg loss
         if num_pos > 0:
             # l1 + iou
@@ -321,7 +327,7 @@ class PPYOLOEHead(nn.Layer):
             loss_dfl = pred_dist.sum() * 0.
         return loss_l1, loss_iou, loss_dfl
 
-    def get_loss(self, head_outs, gt_meta):
+    def get_loss(self, head_outs, gt_meta, soft_cls=None, soft_reg=None):
         pred_scores, pred_distri, anchors,\
         anchor_points, num_anchors_list, stride_tensor = head_outs
 
@@ -389,15 +395,35 @@ class PPYOLOEHead(nn.Layer):
             self._bbox_loss(pred_distri, pred_bboxes, anchor_points_s,
                             assigned_labels, assigned_bboxes, assigned_scores,
                             assigned_scores_sum)
+        # loss_kd
+        if soft_cls is not None:
+            mask_positive = (assigned_labels != self.num_classes)
+            num_pos = mask_positive.sum()
+
+            if num_pos > 0:
+                cls_mask = mask_positive.unsqueeze(-1).tile([1, 1, self.num_classes])
+                pred_scores_pos = paddle.masked_select(pred_scores, cls_mask).reshape([-1, self.num_classes])
+                soft_cls_pos = paddle.masked_select(soft_cls, cls_mask).reshape([-1, self.num_classes])
+
+                loss_kd = self.loss_kd(
+                    pred_scores_pos,
+                    soft_cls_pos,
+                    avg_factor=num_pos)
+            else:
+                loss_kd = paddle.zeros([1])
+
         loss = self.loss_weight['class'] * loss_cls + \
                self.loss_weight['iou'] * loss_iou + \
-               self.loss_weight['dfl'] * loss_dfl
+               self.loss_weight['dfl'] * loss_dfl + \
+               loss_kd
+
         out_dict = {
             'loss': loss,
             'loss_cls': loss_cls,
             'loss_iou': loss_iou,
             'loss_dfl': loss_dfl,
             'loss_l1': loss_l1,
+            'loss_kd': loss_kd,
         }
         return out_dict
 

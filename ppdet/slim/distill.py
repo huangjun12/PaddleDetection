@@ -26,6 +26,8 @@ from ppdet.modeling import ops
 from ppdet.utils.checkpoint import load_pretrain_weight
 from ppdet.utils.logger import setup_logger
 
+from ppdet.modeling.assigners.utils import generate_anchors_for_grid_cell
+
 logger = setup_logger(__name__)
 
 
@@ -672,6 +674,7 @@ class LDDistillModel(nn.Layer):
     def __init__(self, cfg, slim_cfg):
         super(LDDistillModel, self).__init__()
         self.student_model = create(cfg.architecture)
+        self.arch = cfg.architecture
         logger.debug('Load student model pretrain_weights:{}'.format(
             cfg.pretrain_weights))
         load_pretrain_weight(self.student_model, cfg.pretrain_weights)
@@ -688,28 +691,76 @@ class LDDistillModel(nn.Layer):
     def parameters(self):
         return self.student_model.parameters()
 
+    def forward_head(self, head, feats, targets):
+        anchors, anchor_points, num_anchors_list, stride_tensor = \
+            generate_anchors_for_grid_cell(
+                feats, head.fpn_strides, head.grid_cell_scale,
+                head.grid_cell_offset)
+
+        cls_score_list, reg_distri_list = [], []
+        for i, feat in enumerate(feats):
+            avg_feat = F.adaptive_avg_pool2d(feat, (1, 1))
+            cls_logit = head.pred_cls[i](head.stem_cls[i](feat, avg_feat) +
+                                         feat)
+            reg_distri = head.pred_reg[i](head.stem_reg[i](feat, avg_feat))
+            # cls and reg
+            cls_score = F.sigmoid(cls_logit)
+            cls_score_list.append(cls_score.flatten(2).transpose([0, 2, 1]))
+            reg_distri_list.append(reg_distri.flatten(2).transpose([0, 2, 1]))
+        cls_score_list = paddle.concat(cls_score_list, axis=1)
+        reg_distri_list = paddle.concat(reg_distri_list, axis=1)
+        return cls_score_list, reg_distri_list, anchors, anchor_points, num_anchors_list, stride_tensor
+
     def forward(self, inputs):
         if self.training:
+            if self.arch == 'YOLOv3':
+                with paddle.no_grad():
+                    t_body_feats = self.teacher_model.backbone(inputs)
+                    t_neck_feats = self.teacher_model.neck(t_body_feats)
+                    t_head_outs = self.forward_head(self.teacher_model.yolo_head, t_neck_feats, inputs)
 
-            with paddle.no_grad():
-                t_body_feats = self.teacher_model.backbone(inputs)
-                t_neck_feats = self.teacher_model.neck(t_body_feats)
-                t_head_outs = self.teacher_model.head(t_neck_feats)
+                s_body_feats = self.student_model.backbone(inputs)
+                s_neck_feats = self.student_model.neck(s_body_feats)
+                s_head_outs = self.forward_head(self.student_model.yolo_head, s_neck_feats, inputs)
 
-            #student_loss = self.student_model(inputs)
-            s_body_feats = self.student_model.backbone(inputs)
-            s_neck_feats = self.student_model.neck(s_body_feats)
-            s_head_outs = self.student_model.head(s_neck_feats)
+                soft_cls_list = t_head_outs[0]
+                soft_reg_list = t_head_outs[1]
 
-            soft_label_list = t_head_outs[0]
-            soft_targets_list = t_head_outs[1]
-            student_loss = self.student_model.head.get_loss(
-                s_head_outs, inputs, soft_label_list, soft_targets_list)
-            total_loss = paddle.add_n(list(student_loss.values()))
-            student_loss['loss'] = total_loss
-            return student_loss
+                student_loss = self.student_model.yolo_head.get_loss(
+                    s_head_outs, inputs, soft_cls_list, soft_reg_list)
+                total_loss = paddle.add_n(list(student_loss.values()))
+                student_loss['loss'] = total_loss
+                return student_loss
+            else:
+                with paddle.no_grad():
+                    t_body_feats = self.teacher_model.backbone(inputs)
+                    t_neck_feats = self.teacher_model.neck(t_body_feats)
+                    t_head_outs = self.teacher_model.head(t_neck_feats)
+
+                #student_loss = self.student_model(inputs)
+                s_body_feats = self.student_model.backbone(inputs)
+                s_neck_feats = self.student_model.neck(s_body_feats)
+                s_head_outs = self.student_model.head(s_neck_feats)
+
+                soft_label_list = t_head_outs[0]
+                soft_targets_list = t_head_outs[1]
+                student_loss = self.student_model.head.get_loss(
+                    s_head_outs, inputs, soft_label_list, soft_targets_list)
+                total_loss = paddle.add_n(list(student_loss.values()))
+                student_loss['loss'] = total_loss
+                return student_loss
         else:
-            return self.student_model(inputs)
+            if self.arch == 'YOLOv3':
+                body_feats = self.student_model.backbone(inputs)
+                neck_feats = self.student_model.neck(body_feats)
+                yolo_head_outs = self.student_model.yolo_head(neck_feats)
+
+                bbox, bbox_num = self.student_model.yolo_head.post_process(
+                        yolo_head_outs, inputs['scale_factor'])
+                output = {'bbox': bbox, 'bbox_num': bbox_num}
+                return output
+            else:
+                return self.student_model(inputs)
 
 
 @register
